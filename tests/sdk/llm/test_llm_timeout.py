@@ -2,13 +2,18 @@
 
 import asyncio
 import json
+import threading
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 from aiohttp import web
 from litellm.exceptions import Timeout as LiteLLMTimeout
+from litellm.types.llms.openai import OutputTextDeltaEvent, ResponsesAPIStreamEvents
 from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
 from pydantic import SecretStr
 
@@ -562,6 +567,250 @@ async def test_aresponses_hard_timeout_uses_same_attempt_limit() -> None:
     with patch("openhands.sdk.llm.llm.litellm_aresponses", side_effect=never_responds):
         with pytest.raises(LLMTimeoutError, match="shorter or chunked"):
             await llm.aresponses(
+                messages=[Message(role="user", content=[TextContent(text="Hello")])]
+            )
+
+    assert attempts == 2
+
+
+def test_sync_transport_timeout_at_deadline_uses_hard_timeout_limit() -> None:
+    attempts: list[int] = []
+
+    class SlowResponse(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            attempts.append(1)
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            time.sleep(3)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowResponse)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        llm = LLM(
+            model="openai/test-model",
+            api_key=SecretStr("test-key"),
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            usage_id="timeout-test",
+            timeout=1,
+            num_retries=3,
+            retry_min_wait=0,
+            retry_max_wait=0,
+            retry_multiplier=0,
+        )
+        with pytest.raises(LLMTimeoutError, match="shorter or chunked"):
+            llm.completion(
+                messages=[Message(role="user", content=[TextContent(text="Hello")])]
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=1)
+
+    assert len(attempts) == 2
+
+
+@pytest.mark.parametrize("timeout", [30, None])
+def test_sync_provider_timeout_without_deadline_keeps_regular_retries(
+    timeout: int | None,
+) -> None:
+    attempts = 0
+
+    def provider_times_out(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise LiteLLMTimeout(
+            message="provider timeout", model="test-model", llm_provider="openai"
+        )
+
+    llm = LLM(
+        model="openai/test-model",
+        api_key=SecretStr("test-key"),
+        usage_id="timeout-test",
+        timeout=timeout,
+        num_retries=4,
+        retry_min_wait=0,
+        retry_max_wait=0,
+        retry_multiplier=0,
+    )
+    with patch(
+        "openhands.sdk.llm.llm.litellm_completion", side_effect=provider_times_out
+    ):
+        with pytest.raises(LLMTimeoutError, match="provider timeout") as exc_info:
+            llm.completion(
+                messages=[Message(role="user", content=[TextContent(text="Hello")])]
+            )
+
+    assert attempts == 4
+    assert "shorter or chunked" not in str(exc_info.value)
+
+
+def test_sync_timeout_after_stream_output_keeps_regular_retries() -> None:
+    attempts = 0
+    emitted: list[ModelResponseStream] = []
+
+    def stream_then_timeout(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+
+        def chunks():
+            yield ModelResponseStream(
+                id=f"chunk-{attempts}",
+                choices=[StreamingChoices(delta=Delta(content="partial output"))],
+            )
+            time.sleep(1.05)
+            raise LiteLLMTimeout(
+                message="transport timeout", model="test-model", llm_provider="openai"
+            )
+
+        return chunks()
+
+    llm = LLM(
+        model="openai/test-model",
+        api_key=SecretStr("test-key"),
+        usage_id="timeout-test",
+        stream=True,
+        timeout=1,
+        num_retries=3,
+        retry_min_wait=0,
+        retry_max_wait=0,
+        retry_multiplier=0,
+    )
+    with patch(
+        "openhands.sdk.llm.llm.litellm_completion", side_effect=stream_then_timeout
+    ):
+        with pytest.raises(LLMTimeoutError, match="transport timeout") as exc_info:
+            llm.completion(
+                messages=[Message(role="user", content=[TextContent(text="Hello")])],
+                on_token=emitted.append,
+            )
+
+    assert attempts == 3
+    assert len(emitted) == 3
+    assert "shorter or chunked" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_async_sync_iterator_timeout_after_output_keeps_regular_retries() -> None:
+    attempts = 0
+
+    async def stream_then_timeout(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+
+        def chunks():
+            yield ModelResponseStream(
+                id=f"chunk-{attempts}",
+                choices=[StreamingChoices(delta=Delta(content="partial output"))],
+            )
+            time.sleep(1.05)
+            raise LiteLLMTimeout(
+                message="transport timeout", model="test-model", llm_provider="openai"
+            )
+
+        return chunks()
+
+    llm = LLM(
+        model="openai/test-model",
+        api_key=SecretStr("test-key"),
+        usage_id="timeout-test",
+        stream=True,
+        timeout=1,
+        stream_idle_timeout=30,
+        num_retries=3,
+        retry_min_wait=0,
+        retry_max_wait=0,
+        retry_multiplier=0,
+    )
+    with patch(
+        "openhands.sdk.llm.llm.litellm_acompletion", side_effect=stream_then_timeout
+    ):
+        with pytest.raises(LLMTimeoutError) as exc_info:
+            await llm.acompletion(
+                messages=[Message(role="user", content=[TextContent(text="Hello")])],
+                on_token=lambda _: None,
+            )
+
+    assert attempts == 3
+    assert "shorter or chunked" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_aresponses_sync_iterator_timeout_after_output_keeps_retries() -> None:
+    attempts = 0
+
+    async def stream_then_timeout(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+
+        def events():
+            yield OutputTextDeltaEvent(
+                type=ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA,
+                item_id="m1",
+                output_index=0,
+                content_index=0,
+                delta="partial output",
+            )
+            time.sleep(1.05)
+            raise LiteLLMTimeout(
+                message="transport timeout", model="test-model", llm_provider="openai"
+            )
+
+        return events()
+
+    llm = LLM(
+        model="openai/test-model",
+        api_key=SecretStr("test-key"),
+        usage_id="timeout-test",
+        stream=True,
+        timeout=1,
+        stream_idle_timeout=30,
+        num_retries=3,
+        retry_min_wait=0,
+        retry_max_wait=0,
+        retry_multiplier=0,
+    )
+    with patch(
+        "openhands.sdk.llm.llm.litellm_aresponses", side_effect=stream_then_timeout
+    ):
+        with pytest.raises(LLMTimeoutError) as exc_info:
+            await llm.aresponses(
+                messages=[Message(role="user", content=[TextContent(text="Hello")])],
+                on_token=lambda _: None,
+            )
+
+    assert attempts == 3
+    assert "shorter or chunked" not in str(exc_info.value)
+
+
+def test_sync_responses_transport_deadline_uses_hard_timeout_limit() -> None:
+    attempts = 0
+
+    def transport_times_out(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        time.sleep(1.05)
+        raise LiteLLMTimeout(
+            message="transport timeout", model="test-model", llm_provider="openai"
+        )
+
+    llm = LLM(
+        model="openai/test-model",
+        api_key=SecretStr("test-key"),
+        usage_id="timeout-test",
+        timeout=1,
+        num_retries=3,
+        retry_min_wait=0,
+        retry_max_wait=0,
+        retry_multiplier=0,
+    )
+    with patch(
+        "openhands.sdk.llm.llm.litellm_responses", side_effect=transport_times_out
+    ):
+        with pytest.raises(LLMTimeoutError, match="shorter or chunked"):
+            llm.responses(
                 messages=[Message(role="user", content=[TextContent(text="Hello")])]
             )
 

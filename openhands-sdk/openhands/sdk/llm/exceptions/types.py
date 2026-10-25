@@ -122,7 +122,7 @@ class LLMTimeoutError(LLMError):
 
 
 class LLMHardTimeoutError(LLMTimeoutError):
-    """The SDK's per-attempt hard timeout was exhausted."""
+    """A no-output per-attempt deadline was exhausted."""
 
 
 class LLMServiceUnavailableError(LLMError):

@@ -383,8 +383,8 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         default=2,
         ge=1,
         description=(
-            "Maximum attempts for one LLM request that reaches the SDK's hard "
-            "per-attempt timeout. Other retryable errors use num_retries."
+            "Maximum attempts for one LLM request that reaches its configured "
+            "timeout without output. Other retryable errors use num_retries."
         ),
         json_schema_extra=field_meta(SettingProminence.MAJOR),
     )
@@ -1213,6 +1213,38 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             )
         return LiteLLMTimeout(message=message, model=self.model, llm_provider=provider)
 
+    def _transport_timeout_at_deadline(
+        self, started_at: float, output_received: bool
+    ) -> bool:
+        """LiteLLM can reach the configured timeout before the SDK timer does."""
+        return (
+            self.timeout is not None
+            and not output_received
+            and time.monotonic() - started_at >= self.timeout
+        )
+
+    def _sync_transport_timeout_decorator(
+        self, output_received: Callable[[], bool]
+    ) -> Callable[[Callable[..., _T]], Callable[..., _T]]:
+        def decorate(function: Callable[..., _T]) -> Callable[..., _T]:
+            def wrapped(*args: Any, **kwargs: Any) -> _T:
+                timeout = self.timeout
+                if timeout is None:
+                    return function(*args, **kwargs)
+                started_at = time.monotonic()
+                try:
+                    return function(*args, **kwargs)
+                except LiteLLMTimeout as error:
+                    if self._transport_timeout_at_deadline(
+                        started_at, output_received()
+                    ):
+                        raise self._timeout_error("hard timeout", timeout) from error
+                    raise
+
+            return wrapped
+
+        return decorate
+
     def _async_hard_timeout_decorator(
         self,
         output_received: Callable[[], bool] | None = None,
@@ -1221,18 +1253,27 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             function: Callable[..., Awaitable[_T]],
         ) -> Callable[..., Awaitable[_T]]:
             async def wrapped(*args: Any, **kwargs: Any) -> _T:
-                if self.timeout is None:
+                timeout = self.timeout
+                if timeout is None:
                     return await function(*args, **kwargs)
-                timeout_context = asyncio.timeout(self.timeout)
+                started_at = time.monotonic()
+                timeout_context = asyncio.timeout(timeout)
                 try:
                     async with timeout_context:
                         return await function(*args, **kwargs)
+                except LiteLLMTimeout as error:
+                    if self._transport_timeout_at_deadline(
+                        started_at,
+                        output_received() if output_received else False,
+                    ):
+                        raise self._timeout_error("hard timeout", timeout) from error
+                    raise
                 except TimeoutError as error:
                     if not timeout_context.expired():
                         raise
                     raise self._timeout_error(
                         "hard timeout",
-                        self.timeout,
+                        timeout,
                         output_received=output_received() if output_received else False,
                     ) from error
 
@@ -1865,8 +1906,14 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             call_context=call_context,
         )
 
+        produced_output = threading.Event()
+
         @self._make_retry_decorator()
+        @self._sync_transport_timeout_decorator(lambda: produced_output.is_set())
         def _one_attempt(**retry_kwargs: Any) -> ModelResponse:
+            nonlocal produced_output
+            produced_output = threading.Event()
+            attempt_output = produced_output
             assert self._telemetry is not None
             self._telemetry.on_request(telemetry_ctx=telemetry_ctx)
             final_kwargs = {**call_kwargs, **retry_kwargs}
@@ -1875,6 +1922,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                 **final_kwargs,
                 enable_streaming=enable_streaming,
                 on_token=on_token,
+                on_output=attempt_output.set,
             )
             resp = self._validate_chat_response(
                 resp,
@@ -1984,17 +2032,14 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             call_context=call_context,
         )
 
-        produced_output = False
-
-        def mark_output() -> None:
-            nonlocal produced_output
-            produced_output = True
+        produced_output = threading.Event()
 
         @self._make_retry_decorator()
-        @self._async_hard_timeout_decorator(lambda: produced_output)
+        @self._async_hard_timeout_decorator(lambda: produced_output.is_set())
         async def _one_attempt(**retry_kwargs: Any) -> ModelResponse:
             nonlocal produced_output
-            produced_output = False
+            produced_output = threading.Event()
+            attempt_output = produced_output
             assert self._telemetry is not None
             self._telemetry.on_request(telemetry_ctx=telemetry_ctx)
             final_kwargs = {**call_kwargs, **retry_kwargs}
@@ -2003,7 +2048,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                 **final_kwargs,
                 enable_streaming=enable_streaming,
                 on_token=on_token,
-                on_output=mark_output,
+                on_output=attempt_output.set,
             )
             resp = self._validate_chat_response(
                 resp,
@@ -2136,8 +2181,13 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             call_context=call_context,
         )
 
+        produced_output = threading.Event()
+
         @self._make_retry_decorator()
+        @self._sync_transport_timeout_decorator(lambda: produced_output.is_set())
         def _one_attempt(**retry_kwargs: Any) -> ResponsesAPIResponse:
+            nonlocal produced_output
+            produced_output = threading.Event()
             assert self._telemetry is not None
             self._telemetry.on_request(telemetry_ctx=telemetry_ctx)
             final_kwargs = {**call_kwargs, **retry_kwargs}
@@ -2176,6 +2226,18 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                 if not isinstance(ret, Iterable):
                     raise TypeError(f"Expected a response stream, got {type(ret)}")
                 for event in response_events(ret):
+                    if (
+                        isinstance(
+                            event,
+                            (
+                                OutputTextDeltaEvent,
+                                RefusalDeltaEvent,
+                                ReasoningSummaryTextDeltaEvent,
+                            ),
+                        )
+                        and event.delta
+                    ):
+                        produced_output.set()
                     if isinstance(event, ResponseCompletedEvent):
                         completed_response = event
                     output_item, delta_chunk = self._process_stream_event(
@@ -2183,7 +2245,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     )
                     if output_item is not None:
                         collected_output_items.append(output_item)
+                        produced_output.set()
                     if stream_callback is not None and delta_chunk is not None:
+                        produced_output.set()
                         stream_callback(delta_chunk)
 
                 completed_response = get_completed_response(ret, completed_response)
@@ -2301,15 +2365,16 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             call_context=call_context,
         )
 
-        produced_output = False
+        produced_output = threading.Event()
 
         @self._make_retry_decorator()
-        @self._async_hard_timeout_decorator(lambda: produced_output)
+        @self._async_hard_timeout_decorator(lambda: produced_output.is_set())
         async def _one_attempt(
             **retry_kwargs: Any,
         ) -> ResponsesAPIResponse:
             nonlocal produced_output
-            produced_output = False
+            produced_output = threading.Event()
+            attempt_output = produced_output
             assert self._telemetry is not None
             self._telemetry.on_request(telemetry_ctx=telemetry_ctx)
             final_kwargs = {**call_kwargs, **retry_kwargs}
@@ -2366,7 +2431,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                             )
                             and event.delta
                         ):
-                            produced_output = True
+                            attempt_output.set()
                         if isinstance(event, ResponseCompletedEvent):
                             completed_response = event
                         output_item, delta_chunk = self._process_stream_event(
@@ -2374,17 +2439,39 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                         )
                         if output_item is not None:
                             collected_output_items.append(output_item)
-                            produced_output = True
+                            attempt_output.set()
                         if stream_cb is not None and delta_chunk is not None:
-                            produced_output = True
+                            attempt_output.set()
                             await _invoke_token_callback(stream_cb, delta_chunk)
                 else:
                     if not isinstance(ret, Iterable):
                         raise TypeError(f"Expected a response stream, got {type(ret)}")
                     loop = asyncio.get_running_loop()
-                    events = await loop.run_in_executor(
-                        None, list, response_events(ret)
-                    )
+
+                    def collect_events() -> list[ResponseStreamEvent]:
+                        collected: list[ResponseStreamEvent] = []
+                        for event in response_events(ret):
+                            if (
+                                isinstance(
+                                    event,
+                                    (
+                                        OutputTextDeltaEvent,
+                                        RefusalDeltaEvent,
+                                        ReasoningSummaryTextDeltaEvent,
+                                    ),
+                                )
+                                and event.delta
+                            ) or (
+                                isinstance(event, OutputItemEvent)
+                                and event.type
+                                == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE
+                                and event.item is not None
+                            ):
+                                attempt_output.set()
+                            collected.append(event)
+                        return collected
+
+                    events = await loop.run_in_executor(None, collect_events)
                     for event in events:
                         if (
                             isinstance(
@@ -2397,7 +2484,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                             )
                             and event.delta
                         ):
-                            produced_output = True
+                            attempt_output.set()
                         if isinstance(event, ResponseCompletedEvent):
                             completed_response = event
                         output_item, delta_chunk = self._process_stream_event(
@@ -2405,9 +2492,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                         )
                         if output_item is not None:
                             collected_output_items.append(output_item)
-                            produced_output = True
+                            attempt_output.set()
                         if stream_cb is not None and delta_chunk is not None:
-                            produced_output = True
+                            attempt_output.set()
                             await _invoke_token_callback(stream_cb, delta_chunk)
 
                 completed_response = get_completed_response(ret, completed_response)
@@ -2617,6 +2704,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         messages: list[dict[str, Any]],
         enable_streaming: bool = False,
         on_token: TokenCallbackType | None = None,
+        on_output: Callable[[], None] | None = None,
         **kwargs,
     ) -> ModelResponse:
         ret = litellm_completion(
@@ -2628,6 +2716,8 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             chunks: list[ModelResponseStream] = []
             stream = cast(Iterable[ModelResponseStream], ret)
             for chunk in stream:
+                if on_output is not None and self._stream_chunk_has_output(chunk):
+                    on_output()
                 on_token(chunk)
                 chunks.append(chunk)
             ret = litellm.stream_chunk_builder(chunks, messages=messages)
@@ -2650,7 +2740,11 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         )
         for choice in chunk.choices:
             if choice.delta is not None:
-                delta = choice.delta.model_dump(exclude_none=True)
+                delta = (
+                    choice.delta
+                    if isinstance(choice.delta, dict)
+                    else choice.delta.model_dump(exclude_none=True)
+                )
                 if any(delta.get(field) for field in output_fields):
                     return True
         return False
@@ -2687,12 +2781,23 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     chunks.append(chunk)
             else:
                 loop = asyncio.get_running_loop()
+
+                def collect_chunks() -> list[ModelResponseStream]:
+                    collected: list[ModelResponseStream] = []
+                    for chunk in cast(Iterable[ModelResponseStream], ret):
+                        # Record progress while the worker drains the iterator;
+                        # it may time out before returning its buffered chunks.
+                        if on_output is not None and self._stream_chunk_has_output(
+                            chunk
+                        ):
+                            on_output()
+                        collected.append(chunk)
+                    return collected
+
                 synced_chunks: list[ModelResponseStream] = await loop.run_in_executor(
-                    None, list, cast(Iterable[ModelResponseStream], ret)
+                    None, collect_chunks
                 )
                 for chunk in synced_chunks:
-                    if on_output is not None and self._stream_chunk_has_output(chunk):
-                        on_output()
                     await _invoke_token_callback(on_token, chunk)
                     chunks.append(chunk)
             ret = litellm.stream_chunk_builder(chunks, messages=messages)
