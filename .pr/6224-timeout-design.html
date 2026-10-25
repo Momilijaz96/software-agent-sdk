@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bound zero-output LLM timeout retries</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; }
+    body { max-width: 880px; margin: 3rem auto; padding: 0 1.5rem; color: #17212f; line-height: 1.55; }
+    h1, h2 { line-height: 1.2; }
+    h1 { margin-bottom: .3rem; }
+    .lead { color: #475569; font-size: 1.12rem; }
+    table { width: 100%; border-collapse: collapse; margin: 1rem 0 2rem; }
+    th, td { border: 1px solid #cbd5e1; padding: .65rem .8rem; text-align: left; vertical-align: top; }
+    th { background: #eef2f7; }
+    code { background: #eef2f7; padding: .1rem .25rem; border-radius: 3px; }
+    pre { background: #17212f; color: #f8fafc; overflow-x: auto; padding: 1rem; border-radius: 6px; }
+    pre code { background: transparent; padding: 0; }
+    .flow { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin: 1rem 0 2rem; }
+    .flow span { border: 1px solid #94a3b8; border-radius: 6px; padding: .55rem .7rem; }
+    .flow b { color: #475569; }
+  </style>
+</head>
+<body>
+  <h1>Bound zero-output LLM timeout retries</h1>
+  <p class="lead">Issue #6224: a request that repeatedly reaches the 300-second deadline without output should not silently spend all five ordinary retry attempts.</p>
+
+  <h2>Behavior</h2>
+  <table>
+    <thead><tr><th>Case</th><th>Before</th><th>After</th></tr></thead>
+    <tbody>
+      <tr><td>Configured deadline, no output</td><td>All <code>num_retries</code> attempts, normally five</td><td>At most <code>hard_timeout_max_attempts</code>, normally two; terminal <code>LLMHardTimeoutError</code> suggests a shorter or chunked response</td></tr>
+      <tr><td>LiteLLM transport reaches the same deadline</td><td>Could bypass the SDK timer and use all retries</td><td>Counts toward the same no-output attempt cap</td></tr>
+      <tr><td>Provider timeout before deadline, or timeout after streamed output</td><td>Ordinary retry policy</td><td>Ordinary retry policy remains</td></tr>
+      <tr><td>Async stream idle timeout</td><td>Per-chunk idle deadline</td><td>Still uses the independent <code>stream_idle_timeout</code> setting</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Retry boundary</h2>
+  <div class="flow"><span>Chat or Responses call</span><b>→</b><span>per-attempt SDK / LiteLLM deadline</span><b>→</b><span>record whether output appeared</span><b>→</b><span>Tenacity retry decision</span><b>→</b><span>typed error and classification</span></div>
+  <p>The no-output counter lives in the SDK retry decorator. A full-deadline LiteLLM timeout is normalized to the same internal timeout type as an SDK deadline. Retry logs include attempt number, total attempts, and elapsed time. A completed output chunk prevents the early-stop classification, including when a third-party async wrapper supplies a synchronous iterator.</p>
+
+  <h2>Configuration and compatibility</h2>
+  <pre><code>LLM(
+    model="openai/gpt-4o-mini",
+    timeout=300,                 # existing per-attempt deadline, seconds
+    num_retries=5,               # existing ordinary retry limit
+    hard_timeout_max_attempts=2 # new per-profile no-output limit
+)</code></pre>
+  <p>The new field is additive, defaults to two, and is exported by the SDK settings schema. Existing timeout and event payloads remain loadable; no persisted-settings migration is needed. <code>LLMHardTimeoutError</code> subclasses <code>LLMTimeoutError</code>, so existing timeout handlers still catch it. The new classification avoids a futile retry hint after the cap.</p>
+  <p>Partial output preservation and stopping a blocked synchronous transport call are outside this change. The synchronous path counts a timeout when LiteLLM raises it.</p>
+</body>
+</html>
