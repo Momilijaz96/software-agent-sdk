@@ -109,6 +109,11 @@ def test_llm_agent_settings_export_schema_groups_sections() -> None:
     assert llm_fields["llm.api_key"].secret is True
     assert llm_fields["llm.api_key"].prominence is SettingProminence.CRITICAL
     assert llm_fields["llm.base_url"].prominence is SettingProminence.MAJOR
+    assert llm_fields["llm.hard_timeout_max_attempts"].default == 2
+    assert (
+        llm_fields["llm.hard_timeout_max_attempts"].prominence
+        is SettingProminence.MAJOR
+    )
 
     # Excluded fields must not appear
     assert "llm.fallback_strategy" not in llm_fields

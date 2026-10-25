@@ -20,11 +20,22 @@ from .types import (
     LLMBadRequestError,
     LLMContentPolicyViolationError,
     LLMContextWindowExceedError,
+    LLMHardTimeoutError,
     LLMMalformedConversationHistoryError,
     LLMRateLimitError,
     LLMServiceUnavailableError,
     LLMTimeoutError,
 )
+
+
+class SDKHardTimeout(LiteLLMTimeout):
+    """A timeout raised by the SDK's own per-attempt deadline."""
+
+    def __init__(
+        self, message: str, model: str, llm_provider: str, max_attempts: int
+    ) -> None:
+        super().__init__(message=message, model=model, llm_provider=llm_provider)
+        self.retry_max_attempts = max_attempts
 
 
 def map_provider_exception(exception: Exception) -> Exception:
@@ -48,6 +59,13 @@ def map_provider_exception(exception: Exception) -> Exception:
 
     if isinstance(exception, RateLimitError):
         return LLMRateLimitError(str(exception))
+
+    if isinstance(exception, SDKHardTimeout):
+        return LLMHardTimeoutError(
+            f"{exception}. Try a shorter or chunked response, or increase this "
+            "model profile's timeout or hard timeout attempt limit in Advanced "
+            "settings."
+        )
 
     if isinstance(exception, LiteLLMTimeout):
         return LLMTimeoutError(str(exception))

@@ -132,6 +132,17 @@ def test_save_writes_profile_schema_version(
     assert data["schema_version"] == LLM_PROFILE_SCHEMA_VERSION
 
 
+def test_hard_timeout_attempt_limit_survives_profile_save_and_load(
+    profile_store: LLMProfileStore, sample_llm: LLM
+) -> None:
+    sample_llm.hard_timeout_max_attempts = 4
+
+    profile_store.save("custom-timeouts", sample_llm)
+
+    loaded = profile_store.load("custom-timeouts")
+    assert loaded.hard_timeout_max_attempts == 4
+
+
 def test_load_rejects_newer_profile_schema_version(
     profile_store: LLMProfileStore,
 ) -> None:

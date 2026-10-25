@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import threading
+import time
 import warnings
 from collections.abc import (
     AsyncIterable,
@@ -131,6 +132,7 @@ from openhands.sdk.llm.exceptions import (
     looks_like_auth_error,
     map_provider_exception,
 )
+from openhands.sdk.llm.exceptions.mapping import SDKHardTimeout
 
 # OpenHands utilities
 from openhands.sdk.llm.llm_response import LLMResponse
@@ -377,6 +379,15 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     )
 
     num_retries: int = Field(default=5, ge=0, json_schema_extra=field_meta())
+    hard_timeout_max_attempts: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "Maximum attempts for one LLM request that reaches the SDK's hard "
+            "per-attempt timeout. Other retryable errors use num_retries."
+        ),
+        json_schema_extra=field_meta(SettingProminence.MAJOR),
+    )
     retry_multiplier: float = Field(default=8.0, ge=0, json_schema_extra=field_meta())
     retry_min_wait: int = Field(default=8, ge=0, json_schema_extra=field_meta())
     retry_max_wait: int = Field(default=64, ge=0, json_schema_extra=field_meta())
@@ -1146,10 +1157,35 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         Exhausted allowances skip backoff. Provider quota errors may fall back;
         explicit budget denials stop without trying another model.
         """
+        hard_timeouts = 0
+        hard_timeout_limit = min(
+            max(self.num_retries, 1), self.hard_timeout_max_attempts
+        )
+        started_at = time.monotonic()
+
+        def under_hard_timeout_limit(error: BaseException) -> bool:
+            nonlocal hard_timeouts
+            if isinstance(error, SDKHardTimeout):
+                hard_timeouts += 1
+                if hard_timeouts >= hard_timeout_limit:
+                    logger.error(
+                        "%s. Attempt #%d/%d, elapsed %.1fs; stopping retries.",
+                        error,
+                        hard_timeouts,
+                        hard_timeout_limit,
+                        time.monotonic() - started_at,
+                    )
+                    return False
+            return True
+
         retry_condition = (
-            retry_if_exception_type(LLM_RETRY_EXCEPTIONS)
-            | retry_if_exception(is_transient_http_error)
-        ) & retry_if_exception(lambda e: not is_quota_exhaustion_error(e))
+            (
+                retry_if_exception_type(LLM_RETRY_EXCEPTIONS)
+                | retry_if_exception(is_transient_http_error)
+            )
+            & retry_if_exception(lambda e: not is_quota_exhaustion_error(e))
+            & retry_if_exception(under_hard_timeout_limit)
+        )
         return self.retry_decorator(
             num_retries=self.num_retries,
             retry_exceptions=retry_condition,
@@ -1159,15 +1195,27 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             retry_listener=self._retry_listener_fn,
         )
 
-    def _timeout_error(self, detail: str, seconds: float) -> LiteLLMTimeout:
-        return LiteLLMTimeout(
-            message=f"LLM {detail} after {seconds:g} seconds",
-            model=self.model,
-            llm_provider=self._infer_litellm_provider() or "unknown",
-        )
+    def _timeout_error(
+        self, detail: str, seconds: float, *, output_received: bool = False
+    ) -> LiteLLMTimeout:
+        message = f"LLM {detail} after {seconds:g} seconds"
+        if output_received:
+            message += " (output already streamed)"
+        provider = self._infer_litellm_provider() or "unknown"
+        if detail == "hard timeout" and not output_received:
+            return SDKHardTimeout(
+                message=message,
+                model=self.model,
+                llm_provider=provider,
+                max_attempts=min(
+                    max(self.num_retries, 1), self.hard_timeout_max_attempts
+                ),
+            )
+        return LiteLLMTimeout(message=message, model=self.model, llm_provider=provider)
 
     def _async_hard_timeout_decorator(
         self,
+        output_received: Callable[[], bool] | None = None,
     ) -> Callable[[Callable[..., Awaitable[_T]]], Callable[..., Awaitable[_T]]]:
         def decorate(
             function: Callable[..., Awaitable[_T]],
@@ -1182,7 +1230,11 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                 except TimeoutError as error:
                     if not timeout_context.expired():
                         raise
-                    raise self._timeout_error("hard timeout", self.timeout) from error
+                    raise self._timeout_error(
+                        "hard timeout",
+                        self.timeout,
+                        output_received=output_received() if output_received else False,
+                    ) from error
 
             return wrapped
 
@@ -1932,9 +1984,17 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             call_context=call_context,
         )
 
+        produced_output = False
+
+        def mark_output() -> None:
+            nonlocal produced_output
+            produced_output = True
+
         @self._make_retry_decorator()
-        @self._async_hard_timeout_decorator()
+        @self._async_hard_timeout_decorator(lambda: produced_output)
         async def _one_attempt(**retry_kwargs: Any) -> ModelResponse:
+            nonlocal produced_output
+            produced_output = False
             assert self._telemetry is not None
             self._telemetry.on_request(telemetry_ctx=telemetry_ctx)
             final_kwargs = {**call_kwargs, **retry_kwargs}
@@ -1943,6 +2003,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                 **final_kwargs,
                 enable_streaming=enable_streaming,
                 on_token=on_token,
+                on_output=mark_output,
             )
             resp = self._validate_chat_response(
                 resp,
@@ -2240,11 +2301,15 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             call_context=call_context,
         )
 
+        produced_output = False
+
         @self._make_retry_decorator()
-        @self._async_hard_timeout_decorator()
+        @self._async_hard_timeout_decorator(lambda: produced_output)
         async def _one_attempt(
             **retry_kwargs: Any,
         ) -> ResponsesAPIResponse:
+            nonlocal produced_output
+            produced_output = False
             assert self._telemetry is not None
             self._telemetry.on_request(telemetry_ctx=telemetry_ctx)
             final_kwargs = {**call_kwargs, **retry_kwargs}
@@ -2290,6 +2355,18 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     async for event in async_response_events(
                         self._aiter_with_idle_timeout(ret)
                     ):
+                        if (
+                            isinstance(
+                                event,
+                                (
+                                    OutputTextDeltaEvent,
+                                    RefusalDeltaEvent,
+                                    ReasoningSummaryTextDeltaEvent,
+                                ),
+                            )
+                            and event.delta
+                        ):
+                            produced_output = True
                         if isinstance(event, ResponseCompletedEvent):
                             completed_response = event
                         output_item, delta_chunk = self._process_stream_event(
@@ -2297,7 +2374,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                         )
                         if output_item is not None:
                             collected_output_items.append(output_item)
+                            produced_output = True
                         if stream_cb is not None and delta_chunk is not None:
+                            produced_output = True
                             await _invoke_token_callback(stream_cb, delta_chunk)
                 else:
                     if not isinstance(ret, Iterable):
@@ -2307,6 +2386,18 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                         None, list, response_events(ret)
                     )
                     for event in events:
+                        if (
+                            isinstance(
+                                event,
+                                (
+                                    OutputTextDeltaEvent,
+                                    RefusalDeltaEvent,
+                                    ReasoningSummaryTextDeltaEvent,
+                                ),
+                            )
+                            and event.delta
+                        ):
+                            produced_output = True
                         if isinstance(event, ResponseCompletedEvent):
                             completed_response = event
                         output_item, delta_chunk = self._process_stream_event(
@@ -2314,7 +2405,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                         )
                         if output_item is not None:
                             collected_output_items.append(output_item)
+                            produced_output = True
                         if stream_cb is not None and delta_chunk is not None:
+                            produced_output = True
                             await _invoke_token_callback(stream_cb, delta_chunk)
 
                 completed_response = get_completed_response(ret, completed_response)
@@ -2544,12 +2637,31 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         )
         return ret
 
+    @staticmethod
+    def _stream_chunk_has_output(chunk: ModelResponseStream) -> bool:
+        output_fields = (
+            "content",
+            "tool_calls",
+            "function_call",
+            "reasoning_content",
+            "thinking_blocks",
+            "reasoning_items",
+            "audio",
+        )
+        for choice in chunk.choices:
+            if choice.delta is not None:
+                delta = choice.delta.model_dump(exclude_none=True)
+                if any(delta.get(field) for field in output_fields):
+                    return True
+        return False
+
     async def _atransport_call(
         self,
         *,
         messages: list[dict[str, Any]],
         enable_streaming: bool = False,
         on_token: AnyTokenCallbackType | None = None,
+        on_output: Callable[[], None] | None = None,
         **kwargs,
     ) -> ModelResponse:
         """Async variant of :meth:`_transport_call`."""
@@ -2569,6 +2681,8 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             if isinstance(ret, AsyncIterable):
                 stream = cast(AsyncIterable[ModelResponseStream], ret)
                 async for chunk in self._aiter_with_idle_timeout(stream):
+                    if on_output is not None and self._stream_chunk_has_output(chunk):
+                        on_output()
                     await _invoke_token_callback(on_token, chunk)
                     chunks.append(chunk)
             else:
@@ -2577,6 +2691,8 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     None, list, cast(Iterable[ModelResponseStream], ret)
                 )
                 for chunk in synced_chunks:
+                    if on_output is not None and self._stream_chunk_has_output(chunk):
+                        on_output()
                     await _invoke_token_callback(on_token, chunk)
                     chunks.append(chunk)
             ret = litellm.stream_chunk_builder(chunks, messages=messages)

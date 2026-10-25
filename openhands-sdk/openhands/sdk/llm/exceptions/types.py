@@ -121,6 +121,10 @@ class LLMTimeoutError(LLMError):
         super().__init__(message)
 
 
+class LLMHardTimeoutError(LLMTimeoutError):
+    """The SDK's per-attempt hard timeout was exhausted."""
+
+
 class LLMServiceUnavailableError(LLMError):
     def __init__(self, message: str = "LLM service unavailable") -> None:
         super().__init__(message)

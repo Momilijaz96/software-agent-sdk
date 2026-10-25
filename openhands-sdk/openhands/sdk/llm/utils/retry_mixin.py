@@ -11,6 +11,7 @@ from tenacity import (
 )
 
 from openhands.sdk.llm.exceptions import LLMNoResponseError
+from openhands.sdk.llm.exceptions.mapping import SDKHardTimeout
 from openhands.sdk.logger import get_logger
 
 
@@ -39,7 +40,12 @@ class RetryMixin:
                     if retry_state.outcome is not None
                     else None
                 )
-                retry_listener(retry_state.attempt_number, num_retries, exc)
+                total_attempts = (
+                    exc.retry_max_attempts
+                    if isinstance(exc, SDKHardTimeout)
+                    else num_retries
+                )
+                retry_listener(retry_state.attempt_number, total_attempts, exc)
 
             if retry_state.outcome is None:
                 return
@@ -151,8 +157,14 @@ class RetryMixin:
         if max_attempts is not None:
             setattr(cast(Any, exc), "max_retries", max_attempts)
 
+        effective_max = (
+            exc.retry_max_attempts if isinstance(exc, SDKHardTimeout) else max_attempts
+        )
         logger.error(
-            "%s. Attempt #%d | You can customize retry values in the configuration.",
+            "%s. Attempt #%d/%s, elapsed %.1fs | You can customize retry "
+            "values in the configuration.",
             exc,
             retry_state.attempt_number,
+            effective_max if effective_max is not None else "?",
+            retry_state.seconds_since_start or 0.0,
         )

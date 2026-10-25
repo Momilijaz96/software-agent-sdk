@@ -86,6 +86,29 @@ def test_agent_error_event_defaults_to_unknown() -> None:
     assert event.classification.retryable is False
 
 
+def test_sdk_hard_timeout_has_distinct_nonretryable_classification() -> None:
+    hard = classify_error("LLMHardTimeoutError")
+    provider = classify_error("LLMTimeoutError")
+    assert hard.kind == FailureKind.AGENT_ACTION
+    assert hard.retryable is False
+    assert hard.user_action == "none"
+    assert provider.kind == FailureKind.TRANSIENT
+    assert provider.retryable is True
+
+
+def test_old_timeout_event_without_classification_still_loads() -> None:
+    original = ConversationErrorEvent(
+        source="environment", code="LLMTimeoutError", detail="provider timeout"
+    )
+    legacy_payload = original.model_dump(mode="json", exclude={"classification"})
+
+    restored = ConversationErrorEvent.model_validate(legacy_payload)
+
+    assert restored.classification is not None
+    assert restored.classification.kind == FailureKind.TRANSIENT
+    assert restored.classification.retryable is True
+
+
 def test_agent_error_event_preserves_explicit_classification() -> None:
     """An explicitly-provided classification is not overwritten by the validator."""
     explicit = ErrorClassification(

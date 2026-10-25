@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 from aiohttp import web
 from litellm.exceptions import Timeout as LiteLLMTimeout
+from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
 from pydantic import SecretStr
 
 from openhands.sdk.agent import Agent
@@ -44,6 +45,15 @@ class TestLLMTimeoutDefaults:
             "hanging indefinitely and causing runtime idle detection issues."
         )
         assert llm.stream_idle_timeout == DEFAULT_LLM_TIMEOUT_SECONDS
+        assert llm.hard_timeout_max_attempts == 2
+
+    def test_hard_timeout_attempt_limit_can_be_changed_per_llm(self):
+        llm = LLM(model="gpt-4o-mini", usage_id="test-llm", hard_timeout_max_attempts=4)
+        assert llm.hard_timeout_max_attempts == 4
+        assert LLM.model_validate(llm.model_dump()).hard_timeout_max_attempts == 4
+
+        with pytest.raises(ValueError):
+            LLM(model="gpt-4o-mini", usage_id="test-llm", hard_timeout_max_attempts=0)
 
     def test_stream_idle_timeout_defaults_to_configured_timeout(self):
         llm = LLM(model="gpt-4o-mini", usage_id="test-llm", timeout=600)
@@ -421,6 +431,174 @@ async def test_async_hard_timeout_expires_active_attempt() -> None:
     wrapped = llm._async_hard_timeout_decorator()(never_finishes)
     with pytest.raises(LiteLLMTimeout, match="hard timeout"):
         await wrapped()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hard_timeout_max_attempts", "num_retries", "expected_attempts"),
+    [(2, 5, 2), (4, 5, 4), (4, 2, 2), (2, 0, 1)],
+)
+async def test_hard_timeout_attempt_limit(
+    hard_timeout_max_attempts: int,
+    num_retries: int,
+    expected_attempts: int,
+    caplog,
+) -> None:
+    attempts = 0
+    retry_updates: list[tuple[int, int]] = []
+
+    async def never_responds(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        await asyncio.Event().wait()
+
+    llm = LLM(
+        model="openai/test-model",
+        api_key=SecretStr("test-key"),
+        usage_id="timeout-test",
+        timeout=0,
+        num_retries=num_retries,
+        hard_timeout_max_attempts=hard_timeout_max_attempts,
+        retry_min_wait=0,
+        retry_max_wait=0,
+        retry_multiplier=0,
+        retry_listener=lambda attempt, total, _error: retry_updates.append(
+            (attempt, total)
+        ),
+    )
+    with (
+        patch("openhands.sdk.llm.llm.litellm_acompletion", side_effect=never_responds),
+        patch("openhands.sdk.llm.llm.logger") as timeout_logger,
+    ):
+        with pytest.raises(LLMTimeoutError, match="shorter or chunked"):
+            await llm.acompletion(
+                messages=[Message(role="user", content=[TextContent(text="Hello")])]
+            )
+
+    assert attempts == expected_attempts
+    assert retry_updates == [
+        (attempt, expected_attempts) for attempt in range(1, expected_attempts)
+    ]
+    for attempt in range(1, expected_attempts):
+        assert f"Attempt #{attempt}/{expected_attempts}" in caplog.text
+    terminal_log = timeout_logger.error.call_args
+    assert terminal_log is not None
+    assert f"Attempt #{expected_attempts}/{expected_attempts}" in (
+        terminal_log.args[0] % terminal_log.args[1:]
+    )
+    assert "elapsed" in caplog.text or "elapsed" in terminal_log.args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chunk_content", "expected_attempts"),
+    [("partial output", 3), (None, 2)],
+)
+async def test_hard_timeout_distinguishes_stream_output_from_metadata(
+    chunk_content: str | None, expected_attempts: int
+) -> None:
+    attempts = 0
+    emitted: list[ModelResponseStream] = []
+
+    async def streams_then_hangs(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+
+        async def chunks():
+            yield ModelResponseStream(
+                id=f"chunk-{attempts}",
+                choices=[StreamingChoices(delta=Delta(content=chunk_content))],
+            )
+            await asyncio.Event().wait()
+
+        return chunks()
+
+    llm = LLM(
+        model="openai/test-model",
+        api_key=SecretStr("test-key"),
+        usage_id="timeout-test",
+        stream=True,
+        timeout=1,
+        stream_idle_timeout=30,
+        num_retries=3,
+        hard_timeout_max_attempts=2,
+        retry_min_wait=0,
+        retry_max_wait=0,
+        retry_multiplier=0,
+    )
+    with patch(
+        "openhands.sdk.llm.llm.litellm_acompletion", side_effect=streams_then_hangs
+    ):
+        with pytest.raises(LLMTimeoutError, match="hard timeout") as exc_info:
+            await llm.acompletion(
+                messages=[Message(role="user", content=[TextContent(text="Hello")])],
+                on_token=emitted.append,
+            )
+
+    assert attempts == expected_attempts
+    assert len(emitted) == expected_attempts
+    assert ("shorter or chunked" in str(exc_info.value)) is (chunk_content is None)
+
+
+@pytest.mark.asyncio
+async def test_aresponses_hard_timeout_uses_same_attempt_limit() -> None:
+    attempts = 0
+
+    async def never_responds(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        await asyncio.Event().wait()
+
+    llm = LLM(
+        model="openai/test-model",
+        api_key=SecretStr("test-key"),
+        usage_id="timeout-test",
+        timeout=0,
+        num_retries=5,
+        retry_min_wait=0,
+        retry_max_wait=0,
+        retry_multiplier=0,
+    )
+    with patch("openhands.sdk.llm.llm.litellm_aresponses", side_effect=never_responds):
+        with pytest.raises(LLMTimeoutError, match="shorter or chunked"):
+            await llm.aresponses(
+                messages=[Message(role="user", content=[TextContent(text="Hello")])]
+            )
+
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_provider_timeout_keeps_regular_retry_limit() -> None:
+    attempts = 0
+
+    async def provider_times_out(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise LiteLLMTimeout(
+            message="provider timeout", model="test-model", llm_provider="openai"
+        )
+
+    llm = LLM(
+        model="openai/test-model",
+        api_key=SecretStr("test-key"),
+        usage_id="timeout-test",
+        timeout=30,
+        num_retries=4,
+        hard_timeout_max_attempts=2,
+        retry_min_wait=0,
+        retry_max_wait=0,
+        retry_multiplier=0,
+    )
+    with patch(
+        "openhands.sdk.llm.llm.litellm_acompletion", side_effect=provider_times_out
+    ):
+        with pytest.raises(LLMTimeoutError, match="provider timeout"):
+            await llm.acompletion(
+                messages=[Message(role="user", content=[TextContent(text="Hello")])]
+            )
+
+    assert attempts == 4
 
 
 class _TimedOutLLM(LLM):

@@ -62,6 +62,8 @@ def classify_error(code: str, detail: str = "") -> ErrorClassification:
     rate-limit from transient.
     """
     # ── authoritative code-based classification (checked first) ──────────
+    if code == "LLMHardTimeoutError":
+        return _failure(FailureKind.AGENT_ACTION)
     if code in {"LLMAuthenticationError", "ACPAuthRequired"}:
         return _failure(FailureKind.AUTH, user_action="settings")
     if code in {"LLMRateLimitError"}:
